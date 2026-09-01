@@ -40,8 +40,10 @@ func DefaultConfig() *Config {
 					SeparateMessages: false,
 				},
 				SplitOnMarker:       false,
-				MaxLLMRetries:       2,
-				LLMRetryBackoffSecs: 2,
+				MaxLLMRetries:           2,
+				LLMRetryBackoffSecs:     2,
+				LLMRetryOnEmptyContent:  true,
+				LLMRetryOnFinishReasons: []string{"length"},
 			},
 		},
 		Session: SessionConfig{

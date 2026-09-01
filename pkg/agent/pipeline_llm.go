@@ -14,6 +14,7 @@ import (
 	runtimeevents "github.com/sipeed/picoclaw/pkg/events"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
+	"github.com/sipeed/picoclaw/pkg/config"
 )
 
 // CallLLM performs an LLM call with fallback support, hook invocation, and retry logic.
@@ -302,11 +303,23 @@ func (p *Pipeline) CallLLM(
 	if backoffSecs <= 0 {
 		backoffSecs = 2
 	}
-	for retry := 0; retry <= maxRetries; retry++ {
-		exec.response, err = callLLM(exec.callMessages, exec.providerToolDefs)
-		if err == nil {
-			break
-		}
+		for retry := 0; retry <= maxRetries; retry++ {
+			exec.response, err = callLLM(exec.callMessages, exec.providerToolDefs)
+			if err == nil {
+				if semErr := semanticRetryError(p.Cfg.Agents.Defaults, exec.response, retry, maxRetries); semErr != nil {
+					logger.WarnCF("agent", "LLM response triggered semantic retry", map[string]any{
+						"reason":           semErr.Error(),
+						"attempt":          retry + 1,
+						"max_attempts":     maxRetries + 1,
+						"finish_reason":    exec.response.FinishReason,
+						"content_empty":    strings.TrimSpace(exec.response.Content) == "",
+					})
+					err = semErr
+					// fall through to retry path; do not break
+				} else {
+					break
+				}
+			}
 		if ts.hardAbortRequested() && errors.Is(err, context.Canceled) {
 			_ = ts.requestHardAbort()
 			exec.abortedByHardAbort = true
@@ -823,6 +836,14 @@ func transientLLMRetryReason(err error) (string, bool) {
 		return "", false
 	}
 
+	// Semantic retries (empty content, retriable finish_reason) are
+	// always transient; route them through the same retry machinery
+	// as network errors so the operator-facing config (max_llm_retries,
+	// llm_retry_backoff_secs) governs both kinds of failure.
+	if errors.Is(err, errSemanticRetry) {
+		return "semantic", true
+	}
+
 	if failErr := providers.ClassifyError(err, "", ""); failErr != nil {
 		switch failErr.Reason {
 		case providers.FailoverTimeout:
@@ -858,4 +879,47 @@ func transientLLMRetryReason(err error) (string, bool) {
 	}
 
 	return "", false
+}
+
+// semanticRetryError inspects a successful LLM response for semantic
+// conditions that warrant a retry: empty content or a finish_reason
+// that the operator marked as retriable (e.g. "length" when the model
+// was truncated by a token cap). It returns a non-nil error when the
+// response should be retried, and nil when the response is acceptable
+// as a final answer. The attempt and maxAttempts values are read-only
+// and used for logging context only.
+// semanticRetryError is returned by semanticRetryError to mark a
+// successful network response as still retriable (e.g. empty body
+// or a finish_reason that should not be treated as terminal).
+var errSemanticRetry = errors.New("llm semantic retry")
+
+// semanticRetryError inspects a successful LLM response for semantic
+// conditions that warrant a retry: empty content or a finish_reason
+// that the operator marked as retriable (e.g. "length" when the model
+// was truncated by a token cap). It returns a non-nil error when the
+// response should be retried, and nil when the response is acceptable
+// as a final answer. The attempt and maxAttempts values are read-only
+// and used for logging context only.
+func semanticRetryError(defaults config.AgentDefaults, resp *providers.LLMResponse, attempt, maxAttempts int) error {
+	if resp == nil {
+		return nil
+	}
+	// Empty content (only whitespace) is treated as a retriable failure
+	// when the operator opted in. The previous behavior was to surface
+	// the empty response to the caller as a hard failure, which made
+	// transient provider glitches (e.g. rate-limit handshakes returning
+	// an empty 200) look like the model itself being broken.
+	if defaults.LLMRetryOnEmptyContent && strings.TrimSpace(resp.Content) == "" {
+		return fmt.Errorf("%w: empty LLM response (finish_reason=%q)", errSemanticRetry, resp.FinishReason)
+	}
+	if len(defaults.LLMRetryOnFinishReasons) > 0 && resp.FinishReason != "" {
+		for _, want := range defaults.LLMRetryOnFinishReasons {
+			if resp.FinishReason == want {
+				return fmt.Errorf("%w: retriable finish_reason=%q", errSemanticRetry, resp.FinishReason)
+			}
+		}
+	}
+	_ = attempt
+	_ = maxAttempts
+	return nil
 }
